@@ -36,7 +36,7 @@ If the user says "I'll write X myself", write the rest with `X` as a stub that f
 - The user's global code style applies: no comments except the *why*, errors surfaced and never swallowed, idiomatic Go.
 
 ## Runtime (where the user runs it)
-- The VM is `ssh ubuntu@10.2.1.49`, on Harvester: Ubuntu 24.04, 30 vCPU, 48 GB RAM, 150 GB disk, **no GPU**. Ollama runs CPU-only, so speeds are a few tokens/sec. Never claim timings that haven't been measured.
+- The VM is `ssh ubuntu@10.2.1.49`, on Harvester: Ubuntu 24.04, 32 vCPU (AMD EPYC), 48 GB RAM, 150 GB disk, **no GPU**. Ollama runs CPU-only, so speeds are a few tokens/sec. Never claim timings that haven't been measured.
 - The KubeDB docs are a clone of `github.com/kubedb/docs`.
 - The cluster is an existing KubeDB cluster, reached via kubeconfig. Lab namespace: `agent-lab`.
 - Claude can reach the VM over SSH, but the user runs the step commands there. Verify with build and vet; only run things on the VM when the user asks.
