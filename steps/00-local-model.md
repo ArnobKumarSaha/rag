@@ -31,10 +31,31 @@ API reference: <https://github.com/ollama/ollama/blob/main/docs/api.md> and
 
 ### Picking the models
 
-- **`qwen2.5:Nb-instruct`**: the *instruct* version, which follows instructions.
-  A *base* model only continues text (§19, "Base vs Instruct").
-- Ollama's default tags are **quantized** to about 4 bits per weight (`Q4_K_M`).
-  That shrinks a 7B model from ~14 GB to roughly 4–5 GB (§19, "Quantization").
+You compare two questions at once: **4-bit vs 8-bit** (same model) and
+**7B vs 27B** (an older small model vs a newer big one).
+
+| Tag | What it is | Size (ollama.com, Oct 2026) |
+|---|---|---|
+| `qwen2.5:7b-instruct` | Qwen2.5 7B, 4-bit `Q4_K_M`. `rag`'s default chat model. | 4.7 GB |
+| `qwen2.5:7b-instruct-q8_0` | The same model at 8-bit | 8.1 GB |
+| `qwen3.8:27b-q4_K_M` | Qwen3.8 27B, 4-bit. Newer, 4× the parameters, can "think". | 18 GB |
+| `qwen3.8:27b-q8_0` | The same at 8-bit (optional) | 30 GB |
+
+Sources: <https://ollama.com/library/qwen2.5/tags>,
+<https://ollama.com/library/qwen3.8/tags>.
+
+- **Instruct**: `qwen2.5:7b-instruct` follows instructions. A *base* model only
+  continues text (§19, "Base vs Instruct"). Qwen3.8 is post-trained, so it
+  follows instructions too (§19, model card item 2).
+- **Quantization** stores each weight in fewer bits (§19). The suffix names the
+  format: `Q4_K_M` is about 4.5 bits per weight, `q8_0` is 8 bits. 8-bit loses
+  less quality than 4-bit, but it is about twice as big. Which matters more on
+  this VM is what you measure.
+- **Thinking**: Qwen3.8 writes a hidden chain of reasoning before its answer by
+  default (§19, model card item 8). Those are extra *output* tokens. Ollama's
+  native API turns it off with `"think": false`.
+- **`bf16` (16-bit) doesn't fit.** `qwen3.8:27b-bf16` is 56 GB and the VM has
+  48 GB of RAM. That's the §19 formula: 27B × 2 bytes = 54 GB.
 - **`nomic-embed-text`** is an **embedding model**. It turns text into a vector
   of numbers instead of writing text. Step 1 uses it. Here you only pull it and
   check that it answers.
@@ -71,14 +92,24 @@ Ollama's native response reports these timings in **nanoseconds**:
 | `eval_count` / `eval_duration` | Decode: number of tokens and the time they took |
 | `total_duration` | The whole request |
 
-### Why a bigger model is slower here
+### Why bigger or higher-precision models are slower here
 
 The VM has **no GPU**, so the CPU does the math and the weights sit in ordinary
-RAM. Each decode step reads every weight once, so decode speed roughly follows
-"how many GB of weights must be read per token". A 14B model has about twice
-the weights of a 7B model, so expect roughly half the decode speed. That is the
-hypothesis. You will measure the real ratio, so don't trust this one until you
-have numbers.
+RAM. Each decode step reads every weight once, so decode speed should roughly
+follow "how many GB must be read per token", which is the model's file size.
+That gives a hypothesis, relative to `qwen2.5:7b-instruct` at 4.7 GB:
+
+| Model | Size | Predicted decode speed |
+|---|---|---|
+| `qwen2.5:7b-instruct` | 4.7 GB | 1× |
+| `qwen2.5:7b-instruct-q8_0` | 8.1 GB | ~0.6× |
+| `qwen3.8:27b-q4_K_M` | 18 GB | ~0.26× |
+| `qwen3.8:27b-q8_0` | 30 GB | ~0.16× |
+
+These are predictions, not measurements. You fill in the real numbers.
+
+Thinking multiplies the cost: if Qwen3.8 thinks for 600 tokens before a
+200-token answer, you wait for 800 tokens at its slowest decode speed.
 
 ---
 
@@ -109,22 +140,37 @@ export OLLAMA_HOST=http://localhost:11434         # the same env var `rag` reads
 
 ### 2. Pull the models
 
+About 61 GB of downloads in total (the VM disk is 150 GB). Skip the last
+Qwen3.8 line if you don't want the optional 8-bit 27B:
+
 ```bash
-ollama pull qwen2.5:3b-instruct
 ollama pull qwen2.5:7b-instruct
-ollama pull qwen2.5:14b-instruct
+ollama pull qwen2.5:7b-instruct-q8_0
+ollama pull qwen3.8:27b-q4_K_M
+ollama pull qwen3.8:27b-q8_0            # optional
 ollama pull nomic-embed-text
 ollama list
 ```
 
-Illustrative output. Compare the sizes with the §20 table:
+If a `qwen3.8` pull says it needs a newer Ollama version, re-run the install
+script from step 1. It upgrades Ollama in place.
+
+Illustrative output. The sizes should match the table in **Picking the models**:
 
 ```
-NAME                    ID              SIZE      MODIFIED
-qwen2.5:14b-instruct    ...             9.0 GB    ...
-qwen2.5:7b-instruct     ...             4.7 GB    ...
-qwen2.5:3b-instruct     ...             1.9 GB    ...
-nomic-embed-text:latest ...             274 MB    ...
+NAME                        ID              SIZE      MODIFIED
+qwen3.8:27b-q8_0            ...             30 GB     ...
+qwen3.8:27b-q4_K_M          ...             18 GB     ...
+qwen2.5:7b-instruct-q8_0    ...             8.1 GB    ...
+qwen2.5:7b-instruct         ...             4.7 GB    ...
+nomic-embed-text:latest     ...             274 MB    ...
+```
+
+Confirm what the plain `qwen2.5:7b-instruct` tag really is:
+
+```bash
+ollama show qwen2.5:7b-instruct        # look at the "quantization" line: Q4_K_M
+ollama show qwen3.8:27b-q4_K_M         # also check "capabilities": it should list thinking
 ```
 
 ### 3. Clone the docs and check cluster access
@@ -196,45 +242,73 @@ curl -s $OLLAMA_HOST/api/embed \
 # 1
 ```
 
-### 6. Measure tokens/sec for 3B, 7B, and 14B
+### 6. Measure tokens/sec: 4-bit vs 8-bit, 7B vs 27B
 
 Define a shell function that sends the same request to any model and computes
-both rates. `temperature: 0` and a fixed `seed` keep the runs comparable (§5),
-and `num_predict` caps the answer length:
+both rates. `temperature: 0` and a fixed `seed` keep the runs comparable (§5).
+`num_predict` caps the output length (default 256, override with
+`NUM_PREDICT=...`). The optional third argument sets `think`. Send it only to
+Qwen3.8, because qwen2.5 isn't a thinking model:
 
 ```bash
 bench() {
-  jq -n --arg m "$1" --arg p "$2" \
+  jq -n --arg m "$1" --arg p "$2" --arg t "${3:-}" --argjson n "${NUM_PREDICT:-256}" \
     '{model:$m, prompt:$p, stream:false,
-      options:{temperature:0, seed:42, num_predict:256}}' |
+      options:{temperature:0, seed:42, num_predict:$n}}
+     + (if $t == "" then {} else {think: ($t|fromjson)} end)' |
   curl -s "$OLLAMA_HOST/api/generate" -d @- |
   jq '{model,
-       load_s:        (.load_duration/1e9),
-       prompt_tokens: .prompt_eval_count,
-       prefill_tok_s: (if (.prompt_eval_duration // 0) > 0 then .prompt_eval_count/(.prompt_eval_duration/1e9) else null end),
-       output_tokens: .eval_count,
-       decode_tok_s:  (.eval_count/(.eval_duration/1e9)),
-       total_s:       (.total_duration/1e9)}'
+       load_s:          (.load_duration/1e9),
+       prompt_tokens:   .prompt_eval_count,
+       prefill_tok_s:   (if (.prompt_eval_duration // 0) > 0 then .prompt_eval_count/(.prompt_eval_duration/1e9) else null end),
+       output_tokens:   .eval_count,
+       decode_tok_s:    (.eval_count/(.eval_duration/1e9)),
+       total_s:         (.total_duration/1e9),
+       thinking_chars:  ((.thinking // "") | length),
+       answer:          .response}'
 }
 
 PROMPT="$(head -c 4000 ~/kubedb-docs/README.md)
 
 Summarise the text above in 5 bullets."
-
-for m in qwen2.5:3b-instruct qwen2.5:7b-instruct qwen2.5:14b-instruct; do
-  bench "$m" "$PROMPT"     # 1st run: cold, includes load time
-  bench "$m" "$PROMPT"     # 2nd run: warm
-done
 ```
 
-The prompt is ~4,000 characters, which is about 1,000 tokens by the "1 token ≈ 4 characters" rule (§2). If `README.md` is shorter, any KubeDB `.md` file works.
+The prompt is ~4,000 characters, which is about 1,000 tokens by the "1 token ≈
+4 characters" rule (§2). If `README.md` is shorter, any KubeDB `.md` file works.
+
+**6a. Speed, with thinking off.** Each model runs twice, cold then warm. Then
+`ollama stop` unloads it, so the next model gets the RAM. 18 GB and 30 GB
+models don't fit side by side with the others.
+
+```bash
+for m in qwen2.5:7b-instruct qwen2.5:7b-instruct-q8_0; do
+  bench "$m" "$PROMPT"; bench "$m" "$PROMPT"; ollama stop "$m"
+done
+for m in qwen3.8:27b-q4_K_M qwen3.8:27b-q8_0; do         # drop q8_0 if you skipped it
+  bench "$m" "$PROMPT" false; bench "$m" "$PROMPT" false; ollama stop "$m"
+done
+```
 
 Illustrative output, **not measured**. Your numbers will be different:
 
 ```json
 { "model": "qwen2.5:7b-instruct", "load_s": 3.1, "prompt_tokens": 1012,
-  "prefill_tok_s": 60.0, "output_tokens": 256, "decode_tok_s": 6.0, "total_s": 63.0 }
+  "prefill_tok_s": 60.0, "output_tokens": 256, "decode_tok_s": 6.0, "total_s": 63.0,
+  "thinking_chars": 0, "answer": "- KubeDB is ..." }
 ```
+
+**6b. What thinking costs.** Same model, same short question, thinking off and
+then on. Raise the cap so the reasoning has room to finish:
+
+```bash
+Q="A KubeDB Postgres pod is Running but the Postgres object stays NotReady. List 3 likely causes."
+NUM_PREDICT=2048 bench qwen3.8:27b-q4_K_M "$Q" false
+NUM_PREDICT=2048 bench qwen3.8:27b-q4_K_M "$Q" true
+```
+
+Before you run the `true` line, estimate the worst case: 2048 ÷ your
+`decode_tok_s` from 6a is how long it could take, in seconds. Use that to
+decide whether to wait or lower `NUM_PREDICT`.
 
 Ollama's CLI prints the same two rates if you pass `--verbose`, which is a quick way to cross-check:
 
@@ -245,12 +319,20 @@ ollama run qwen2.5:7b-instruct --verbose "Explain Postgres replication lag in 3 
 
 ### 7. Pick the chat model
 
-Read the 5-bullet summaries from the three models next to each other, then
-weigh quality against decode speed. `rag` defaults to `qwen2.5:7b-instruct`. If
-you choose a different model, export it before every later step:
+Read the `answer` fields from 6a next to each other, then weigh quality against
+decode speed. Two questions to settle:
+
+- Is the 8-bit answer actually better than the 4-bit answer of the same model,
+  and is it worth the speed you measured?
+- Is Qwen3.8's answer better enough than qwen2.5's to pay for its decode speed,
+  with thinking off? And does thinking improve the 6b answer enough to pay for
+  `output_tokens` growing?
+
+`rag` defaults to `qwen2.5:7b-instruct`. If you choose a different model,
+export it before every later step:
 
 ```bash
-export RAG_CHAT_MODEL=qwen2.5:14b-instruct      # only if you picked it
+export RAG_CHAT_MODEL=qwen3.8:27b-q4_K_M      # only if you picked it
 ```
 
 ---
@@ -270,14 +352,21 @@ export RAG_CHAT_MODEL=qwen2.5:14b-instruct      # only if you picked it
 4. **Prefill is much faster than decode.** Compare `prefill_tok_s` with
    `decode_tok_s` for each model. This is §2's "input is fast, output is slow",
    measured on your own hardware.
-5. **Model size vs speed.** Divide the 7B decode rate by the 14B decode rate.
-   Is it close to 2, as the hypothesis predicted?
-6. **The warm prefill may be suspiciously fast.** On the second identical
+5. **Bytes vs speed.** Divide each model's `decode_tok_s` by the
+   `qwen2.5:7b-instruct` rate and compare with the predicted column in "Why
+   bigger or higher-precision models are slower here". If the measured ratios
+   follow file size, decode on this VM is limited by how fast RAM can be read.
+6. **Thinking cost (6b).** With `think: true`, `thinking_chars` is non-zero and
+   `output_tokens` should jump, because the reasoning is generated one token at
+   a time like the answer. `total_s` grows by about the extra tokens ÷
+   `decode_tok_s`.
+7. **The warm prefill may be suspiciously fast.** On the second identical
    request, Ollama can reuse the cached prompt (KV cache), so
    `prompt_eval_count` may drop and `prefill_tok_s` may come back `null`. Use
    the first run for the prefill rate. Use either run for decode.
-7. **`free -g` while the 14B model is loaded.** The RAM it uses is the weights
-   (`ollama list` size) plus the KV cache (§20).
+8. **`free -g` while a 27B model is loaded.** The RAM it uses is the weights
+   (`ollama list` size) plus the KV cache (§20). With `qwen3.8:27b-q8_0`,
+   that's 30 GB of 48 GB before the conversation even starts.
 
 ---
 
@@ -331,15 +420,16 @@ own retrieved context.
 
 Ollama version:
 
-| Model | load_s (cold) | prompt tokens | prefill tok/s | output tokens | decode tok/s | total_s |
-|---|---|---|---|---|---|---|
-| qwen2.5:3b-instruct | | | | | | |
-| qwen2.5:7b-instruct | | | | | | |
-| qwen2.5:14b-instruct | | | | | | |
+| Model | load_s (cold) | prompt tokens | prefill tok/s | output tokens | decode tok/s | total_s | decode ratio vs 7B q4 (predicted) |
+|---|---|---|---|---|---|---|---|
+| qwen2.5:7b-instruct | | | | | | | 1× (1×) |
+| qwen2.5:7b-instruct-q8_0 | | | | | | | (~0.6×) |
+| qwen3.8:27b-q4_K_M | | | | | | | (~0.26×) |
+| qwen3.8:27b-q8_0 | | | | | | | (~0.16×) |
 
-7B ÷ 14B decode ratio:
+Thinking (6b, qwen3.8:27b-q4_K_M): output tokens off / on = ____ / ____, total_s off / on = ____ / ____
 
-Quality notes (3B vs 7B vs 14B summaries):
+Quality notes (4-bit vs 8-bit; qwen2.5 7B vs qwen3.8 27B; thinking off vs on):
 
 Break it: default `num_ctx` = ____, `prompt_eval_count` before / after = ____ / ____, prefill_s at 16K = ____
 

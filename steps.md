@@ -8,7 +8,7 @@ Runtime (VM): Ollama (`qwen2.5:7b-instruct` chat, `nomic-embed-text` embeddings)
 
 | # | Concept (notes §) | What you build | New deps | Size |
 |---|---|---|---|---|
-| 0 | Local model serving, baseline speed (§19, §20) | No Go. VM setup (Ollama, models, docs clone, kubeconfig); `curl` the OpenAI-compatible and native endpoints by hand; measure tokens/sec (prompt eval vs decode) for 3B / 7B / 14B on the same prompt. Pick the chat model from measured numbers. Adds `Makefile` (`build`, `fmt`). | none | md + Makefile |
+| 0 | Local model serving, baseline speed (§19, §20) | No Go. VM setup (Ollama, models, docs clone, kubeconfig); `curl` the OpenAI-compatible and native endpoints by hand; measure tokens/sec (prompt eval vs decode) on the same prompt for qwen2.5 7B at 4-bit vs 8-bit and qwen3.8 27B at 4-bit (8-bit optional), plus qwen3.8 with thinking on vs off. Pick the chat model from measured numbers. Adds `Makefile` (`build`, `fmt`). | none | md + Makefile |
 | 1 | Embeddings & cosine similarity (§7) | `rag embed "a" "b" "c"` → calls Ollama `/api/embed`, prints vector dims + pairwise cosine matrix. | none | ~80 lines |
 | 2 | Chunking (§8) | `rag chunk --docs <dir>` → walks kubedb docs `*.md`, strips Hugo front-matter, splits on H2/H3, prints chunk count + size histogram (~token estimate). Experiment: fixed 100-token chunks vs heading chunks. | none | ~120 |
 | 3 | Indexing, vector search & a first eval (§9, §17) | `rag index` → embeds every chunk, saves `index.json`; `rag search "q"` → brute-force cosine, top-5 with `path#heading`. `evals/retrieval.json`: 10 questions → expected chunk; `rag eval` prints hit@5. Every later retrieval change gets a number. | none | ~150 |
