@@ -5,7 +5,7 @@ The goal is learning, not shipping. The user is a DevOps/platform engineer (Go, 
 ## Sources of truth
 - `steps.md` is the roadmap: the step table, what each step builds, and its notes § reference.
 - The user's study notes are in `~/yamls/learn/ai/llm-basics-1.md` and `llm-basics-2.md`. The `§N` numbers in `steps.md` refer to sections in them. Read the relevant section before writing a step, and use its terms and examples, so the code and notes don't contradict each other.
-- Progress lives in git. A step is done when `steps/NN-*.md` exists and its tag `step-NN` is in `git tag`. The next step is the first row in `steps.md` (in table order) that has no `steps/NN-*.md`. `NN` is zero-padded, and split steps keep their letter: `00`, `01`, …, `04a`, `04b`.
+- Progress lives in git. A step is done when `steps/NN-*.md` exists and a `step NN: ...` commit is on `master`. Don't tag steps. The next step is the first row in `steps.md` (in table order) that has no `steps/NN-*.md`. `NN` is zero-padded, and split steps keep their letter: `00`, `01`, …, `04a`, `04b`.
 
 ## Doing a step (one per session turn, then stop)
 1. Read the step's row in `steps.md`, the code from earlier steps, and the referenced notes §.
@@ -18,7 +18,7 @@ The goal is learning, not shipping. The user is a DevOps/platform engineer (Go, 
    - **Break it**: one experiment to run on purpose, and what should happen.
    - **My results**: left empty for the user to fill in on the VM.
 4. Run `go build ./...`, `go vet ./...` and `make fmt`. Report any failure verbatim. Step 0 has no Go code; it creates the `Makefile`.
-5. Commit directly on `master`. This repo overrides the global feature-branch rule. Make one commit, `git commit -s -m "step NN: <concept>"`, then tag it `git tag step-NN`. Ask before pushing.
+5. Commit directly on `master`. This repo overrides the global feature-branch rule. Make one commit, `git commit -s -m "step NN: <concept>"`. Ask before pushing.
 6. Stop. Summarize what to read first and what to run. Don't start the next step.
 
 If the user says "I'll write X myself", write the rest with `X` as a stub that fails clearly (for example returning `errors.New("implement me: cosine")`). In `steps/NN-*.md`, explain what X must do and how to check it.
@@ -36,7 +36,7 @@ If the user says "I'll write X myself", write the rest with `X` as a stub that f
 - The user's global code style applies: no comments except the *why*, errors surfaced and never swallowed, idiomatic Go.
 
 ## Runtime (where the user runs it)
-- The VM is on Harvester: Ubuntu 24.04, 30 vCPU, 48 GB RAM, 150 GB disk, **no GPU**. Ollama runs CPU-only, so speeds are a few tokens/sec. Never claim timings that haven't been measured.
+- The VM is `ssh ubuntu@10.2.1.49`, on Harvester: Ubuntu 24.04, 30 vCPU, 48 GB RAM, 150 GB disk, **no GPU**. Ollama runs CPU-only, so speeds are a few tokens/sec. Never claim timings that haven't been measured.
 - The KubeDB docs are a clone of `github.com/kubedb/docs`.
 - The cluster is an existing KubeDB cluster, reached via kubeconfig. Lab namespace: `agent-lab`.
-- Claude can't reach the VM. Verify with build and vet only, and say that you did.
+- Claude can reach the VM over SSH, but the user runs the step commands there. Verify with build and vet; only run things on the VM when the user asks.

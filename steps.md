@@ -27,7 +27,7 @@ Later: BM25 hybrid + re-ranker (§22 step 5), measured with the step-3 eval.
 Per step, choose: Claude writes all of it, or "I'll write X myself" (e.g. cosine in 1, chunker in 2, the agent loop in 5) — X is left as a stub that fails clearly, with its contract in the step md.
 
 ## Git
-Commit directly on `master`, one `-s` commit per step, tagged `step-NN`. `git diff step-02 step-03` shows exactly one concept.
+Commit directly on `master`, one `-s` commit per step, message `step NN: <concept>`. `git show` on a step's commit shows exactly one concept.
 
 ## Verification per step
 `go build ./...` + `go vet ./...` + `make fmt` on the Mac. Running against Ollama/cluster happens on the VM.
