@@ -11,7 +11,110 @@ numbers you record here are the speeds you'll be working with.
 
 ## Concept
 
-### Ollama is a model server
+### 1. The computer as a kitchen
+
+Every speed in this step comes down to two questions: **who does the work**, and
+**how fast can the work get to them**. A kitchen answers both.
+
+#### The cooks: CPU, cores, threads
+
+| Word | Kitchen | On this VM |
+|---|---|---|
+| **CPU** (the chip) | The whole crew | `AMD EPYC-Milan Processor` in `lscpu` |
+| **Core** | One cook with one stove. Does the work: add, multiply, compare. | 32 (`Core(s) per socket: 32`) |
+| **Hardware thread** (SMT, or "hyperthreading") | One cook juggling two orders on the same stove. Faster than one order, but nowhere near 2×, because the stove is shared. | `Thread(s) per core: 1`, so none inside the VM |
+| **vCPU** | A cook **rented** from a landlord (the hypervisor). It may be a whole real cook, or one hand of a cook who is also juggling another restaurant's order. | 32 vCPUs, which Harvester schedules onto its real cores |
+| **Software thread** (what Ollama's `num_thread` sets) | An **order ticket**: one piece of work waiting for a cook | `num_thread: 8` = 8 tickets per step of work |
+| **OS scheduler** | The **head chef**, who hands tickets to cooks | the Linux kernel |
+
+The rented part matters. The landlord sometimes borrows your cook to work for
+another restaurant (another VM) for a moment. That's **steal time**: the `st`
+column in `vmstat`, as a percentage of time.
+
+If there are more tickets than cooks, each cook keeps switching between
+tickets. That's **context switching**. It adds overhead and gains no speed.
+
+#### Where things are kept: cache, RAM, disk, ROM
+
+A cook can only work on what is right in front of them. Everything else waits
+somewhere further away:
+
+| Kitchen | Computer | Size on this VM | How fast to reach | Kept when power is off? |
+|---|---|---|---|---|
+| Cutting board, under the cook's hands | **Cache**, inside the CPU | a few MB (`lscpu \| grep cache`) | instant | no |
+| Fridge in the next room | **RAM** (memory) | 48 GB | slower | no |
+| Warehouse across town | **Disk** (storage) | 150 GB | much slower | yes |
+| Recipe card bolted to the wall | **ROM** (read-only memory) | tiny | — | yes |
+
+- **RAM forgets on power-off. Disk doesn't.** That's why a model must be
+  *loaded* from disk into RAM again after a restart.
+- **ROM** holds the firmware (BIOS/UEFI): the fixed instructions for starting
+  the machine. It plays no part in running a model. Phones often call their
+  storage "ROM", but that's really flash storage, the same role as disk.
+
+#### The conveyor belt: memory bandwidth
+
+Data moves from the fridge (RAM) to the cutting board (cache) on a **conveyor
+belt**. Its speed, in GB per second, is the **memory bandwidth**. All cooks
+share one belt. Hiring more cooks doesn't make the belt faster.
+
+#### Two kinds of work
+
+- **The belt is the limit** (**memory-bandwidth-bound**). Each ingredient needs
+  very little cooking, for example "add 1 to each of a billion numbers". The
+  cooks finish instantly and wait for the belt. More cooks means more people
+  waiting at the same belt.
+- **The cooks are the limit** (**compute-bound**). Each ingredient needs lots of
+  work once it's on the board. Here more cooks help, up to the number of real
+  cooks you have.
+
+There's a third problem when cooks must work **in step**: if every cook must
+finish their share before anyone starts the next stage, the whole kitchen moves
+at the pace of the slowest cook. A cook who is out on loan (steal time) holds
+everyone up.
+
+#### The kitchen next door: the GPU
+
+A **GPU** is a second kitchen, built for one kind of job: the same simple step
+done to a huge amount of data at once. Model math is mostly multiplying big
+grids of numbers (**matrix multiplication**), which is exactly that kind of job.
+
+There are two kinds of GPU:
+
+- **Discrete GPU**: a separate card or chip, like an NVIDIA RTX 4090 or H100.
+  It is a real kitchen next door, with its **own fridge**, called **VRAM**
+  (§20), and its own much faster belt.
+- **Integrated GPU**: built into the CPU chip, like Intel/AMD laptop graphics
+  or Apple Silicon. These are extra line cooks squeezed into the CPU kitchen.
+  They have **no fridge of their own** and share the RAM and its belt.
+
+| | CPU kitchen (this VM) | Discrete GPU kitchen |
+|---|---|---|
+| Cooks | A few skilled chefs. Each can handle any recipe. | Thousands of simple line cooks, all doing the same step together |
+| Fridge | RAM: 48 GB here | VRAM: e.g. 24 GB on an RTX 4090, 80 GB on an H100 |
+| Belt | ~35 GB/s here (measured indirectly in "Threads" below) | ~1,000 GB/s on an RTX 4090, ~3,350 GB/s on an H100 SXM (NVIDIA spec sheets) |
+
+**PCIe** is the road between the CPU kitchen and a discrete GPU. It's slower
+than either belt, so it's used mainly once, to carry the weights into VRAM.
+
+What a discrete GPU changes:
+
+- **Compute-bound work** gets thousands of cooks, a big speed-up.
+- **Belt-bound work** gets a belt that is 30–100× faster.
+- **What has to fit** is VRAM, not RAM. RAM still holds the OS, Ollama, your
+  own programs, and anything that doesn't fit in VRAM.
+- **If the job doesn't fit in VRAM**, part of it runs in each kitchen, and the
+  slow kitchen sets the pace.
+
+**Apple Silicon** is the integrated kind done well: one fridge shared by CPU
+and GPU (**unified memory**, §20), with a faster belt than ordinary PC RAM.
+There's no PCIe trip, and a 64 GB Mac can hold models that no 24 GB GPU can.
+But it has far fewer cooks than a big discrete GPU.
+
+**This VM:** 32 rented cooks, a 48 GB fridge, a 150 GB warehouse, and **no
+kitchen next door**. The Ollama log says `inference compute ... library=cpu`.
+
+### 2. Ollama is a model server
 
 **Ollama** (<https://ollama.com>) is a single daemon that downloads models and
 serves them over HTTP on port `11434`. It works like `dockerd`: `ollama pull`
@@ -29,7 +132,30 @@ Ollama has two HTTP APIs:
 API reference: <https://github.com/ollama/ollama/blob/main/docs/api.md> and
 <https://github.com/ollama/ollama/blob/main/docs/openai.md>.
 
-### Picking the models
+**Where a model lives, in kitchen terms:**
+
+1. `ollama pull` puts the weights in the **warehouse** (disk, under
+   `/usr/share/ollama/.ollama/models`). They stay there until `ollama rm`.
+2. The first request to a model copies the weights into the **fridge**: RAM
+   here, or VRAM on a machine with a GPU. That copy is the `load_duration` in
+   the response, and it takes seconds.
+3. While the model stays loaded, every token reads the weights from the
+   fridge, never from disk.
+4. After 5 idle minutes, Ollama empties that part of the fridge. The disk copy
+   stays, so the next request loads it again.
+
+`ollama ps` lists what's in the fridge right now:
+
+- **`PROCESSOR`** shows **which fridge** the model is in. It isn't a CPU count
+  or a thread count. `100% CPU` means all of it is in RAM, `100% GPU` means all
+  of it is in VRAM, and `48%/52% CPU/GPU` is a split
+  (<https://docs.ollama.com/faq>). On this VM it's always `100% CPU`.
+- **`SIZE`** is bigger than the file (5.1 GB vs 4.7 GB for
+  `qwen2.5:7b-instruct`). It includes working buffers and the **KV cache**: the
+  model's notes about the tokens it has already read, so it doesn't redo them
+  (§20). The KV cache grows with the context length.
+
+### 3. Picking the models
 
 You compare two questions at once: **4-bit vs 8-bit** (same model) and
 **7B vs 27B** (an older small model vs a newer big one).
@@ -48,9 +174,9 @@ Sources: <https://ollama.com/library/qwen2.5/tags>,
   continues text (§19, "Base vs Instruct"). Qwen3.8 is post-trained, so it
   follows instructions too (§19, model card item 2).
 - **Quantization** stores each weight in fewer bits (§19). 8-bit loses less
-  quality than 4-bit, but it is about twice as big. Which matters more on this
-  VM is what you measure. The suffix names the llama.cpp format
-  (<https://github.com/ggml-org/llama.cpp/pull/1684>):
+  quality than 4-bit, but it is about twice as big, so twice as much has to
+  ride the belt. Which matters more on this VM is what you measure. The suffix
+  names the llama.cpp format (<https://github.com/ggml-org/llama.cpp/pull/1684>):
   - **`Q4`**: each weight is stored as a whole number 0–15 (4 bits).
   - **`K`**: weights are quantized in blocks of 32, and each block keeps its own
     *min* and *scale* (step size). Example: a block spans −0.12 to +0.09, so
@@ -75,67 +201,19 @@ Sources: <https://ollama.com/library/qwen2.5/tags>,
   of numbers instead of writing text. Step 1 uses it. Here you only pull it and
   check that it answers.
 
-### CPU and memory: a kitchen
+### 4. A request has two phases: prefill and decode
 
-To understand the speeds in this step, you need a picture of where the model
-lives and who does the work. Think of a kitchen.
-
-**The CPU is the cook.** It does the work (add, multiply, compare), very fast,
-but only on what's right in front of it.
-
-- A **core** is one cook. The VM has 32 virtual cores (**vCPUs**).
-- A **thread** is one task handed to a cook. `num_thread: 8` tells Ollama to
-  split the work into 8 tasks, run by 8 cooks at once.
-
-**Memory is where the ingredients wait.** There are three places, at three
-distances:
-
-| Kitchen | Computer | Size on this VM (roughly) | Reach time |
-|---|---|---|---|
-| Cutting board, under the cook's hands | **Cache**, inside the CPU | a few MB | instant |
-| Fridge in the next room | **RAM** | 48 GB | slower |
-| Warehouse across town | **Disk** | 150 GB | much slower |
-
-Data travels from the fridge to the cutting board on a **conveyor belt**. The
-belt's speed, in GB per second, is the **memory bandwidth**. All cooks share one
-belt. Hiring more cooks doesn't make the belt faster.
-
-**Where a model lives, step by step:**
-
-1. `ollama pull` puts the weights in the **warehouse** (disk, under
-   `/usr/share/ollama/.ollama/models`). They stay there until `ollama rm`.
-2. The first request to a model copies the weights from disk into the
-   **fridge** (RAM). That's the `load_duration` in the response, and it takes
-   seconds.
-3. While the model stays loaded, every token reads the weights from RAM, never
-   from disk. `ollama ps` shows what's in RAM right now.
-4. After 5 idle minutes, Ollama empties that part of the fridge. The disk copy
-   stays, so the next request loads it again.
-
-**Two kinds of work.**
-
-- **The belt is the limit** (**memory-bandwidth-bound**). Each ingredient needs
-  very little cooking, for example "add 1 to each of a billion numbers". The
-  cooks finish instantly and wait for the belt. More cooks means more people
-  waiting at the same belt.
-- **The cooks are the limit** (**compute-bound**). Each ingredient needs lots of
-  work once it's on the board. Here more cooks help, up to the number of real
-  cooks you have.
-
-The next section shows that a model does both kinds of work, one after the other.
-
-### A request has two phases: prefill and decode
-
-Every generation request goes through two phases (`ai-platform-basics.md` §5):
+Every generation request goes through two phases (`ai-platform-basics.md` §5),
+and they are the two kinds of work from the kitchen:
 
 - **Prefill** (Ollama calls it *prompt eval*): the model reads the whole prompt
   in one pass. Each weight rides the belt once and is then used for *every*
-  prompt token, so there's plenty of cooking per trip. That makes prefill
+  prompt token, so there's plenty of cooking per trip. Prefill is
   **compute-bound**. This phase sets **TTFT**, the time to first token.
 - **Decode** (Ollama calls it *eval*): the model writes the answer one token at
   a time. Each token needs *all* the weights, the weights are far bigger than
-  the cache, and each weight gets only about one multiply-add. So for every
-  token the whole model rides the belt again. That makes decode
+  the cutting board (cache), and each weight gets only about one multiply-add.
+  So for every token the whole model rides the belt again. Decode is
   **memory-bandwidth-bound**. This phase sets how fast the answer streams out.
 
 So a model has **two speeds**, both measured in tokens per second:
@@ -150,22 +228,26 @@ prefill. Answer 200 tokens at 5 tok/s is 40 s of decode. Total is about 50 s,
 and most of it is decode. This is the latency rule from §16: total time is
 dominated by *output* tokens.
 
+With a discrete GPU, both phases speed up for the reasons in the kitchen
+section. Decode is still belt-bound there, just on a faster belt. Rough upper
+limit for a 4.7 GB model: 4.7 GB ÷ 1,000 GB/s ≈ 200 tok/s on an RTX 4090. Real
+numbers come in lower.
+
 Ollama's native response reports these timings in **nanoseconds**:
 
 | Field | Meaning |
 |---|---|
-| `load_duration` | Time spent loading the weights into RAM. Large on the first call, near zero while the model stays loaded. |
+| `load_duration` | Time spent loading the weights into the fridge. Large on the first call, near zero while the model stays loaded. |
 | `prompt_eval_count` / `prompt_eval_duration` | Prefill: number of tokens and the time they took |
 | `eval_count` / `eval_duration` | Decode: number of tokens and the time they took |
 | `total_duration` | The whole request |
 
-### Why bigger or higher-precision models are slower here
+### 5. Why bigger or higher-precision models are slower here
 
-The VM has **no GPU**, so the CPU does the math and the loaded weights sit in
-ordinary RAM. Decode is belt-bound: every token moves the whole model across the
-belt. So decode speed should roughly follow "how many GB ride the belt per
-token", which is the model's file size.
-That gives a hypothesis, relative to `qwen2.5:7b-instruct` at 4.7 GB:
+Decode is belt-bound: every token moves the whole model across the belt. So
+decode speed should roughly follow "how many GB ride the belt per token", which
+is the model's file size. That gives a hypothesis, relative to
+`qwen2.5:7b-instruct` at 4.7 GB:
 
 | Model | Size | Predicted decode speed |
 |---|---|---|
@@ -179,9 +261,9 @@ These are predictions, not measurements. You fill in the real numbers.
 Thinking multiplies the cost: if Qwen3.8 thinks for 600 tokens before a
 200-token answer, you wait for 800 tokens at its slowest decode speed.
 
-### Threads: more cooks can be slower
+### 6. Threads: more cooks can be slower
 
-By default Ollama uses one thread per vCPU, so 32 on this VM. The Ollama log
+By default Ollama writes one ticket per vCPU, so 32 on this VM. The Ollama log
 shows `n_threads = 32`. You'd expect 32 cooks to beat 8. On this VM, they
 don't. These are **measured** numbers from this VM (2026-10-04,
 `qwen2.5:7b-instruct` already loaded, short prompt, 48 output tokens):
@@ -196,24 +278,28 @@ don't. These are **measured** numbers from this VM (2026-10-04,
 | 16 | – | 5.3 |
 | 32 (default) | – | 1.6–1.7 |
 
-Two things explain the table:
+The kitchen explains the table:
 
 1. **Decode is flat from 4 to 10 threads.** That's the belt limit. 4 cooks
    already take everything the belt delivers: 4.7 GB × 7.5 tok/s ≈ 35 GB/s.
    Prefill keeps getting faster with more threads (43 → 80 tok/s), because it's
    compute-bound and more cooks help.
 2. **Past ~12 threads, decode gets slower.** The model works layer by layer
-   (about 28 layers for this model). In each layer, every cook does a share,
-   and **nobody starts the next layer until all cooks are done**. The 32 vCPUs
-   are borrowed: Harvester shares the real cores with other VMs, and sometimes
-   pauses a vCPU to run someone else's work. That pause is **steal time**, the
-   `st` column in `vmstat`. It was 22–38% during the 32-thread run and about
-   0% just before it. With 32 cooks, at almost every layer boundary one of them
-   has been paused, and the other 31 stand waiting. That's 625 ms per token at
-   32 threads vs 135 ms at 8.
+   (about 28 layers for this model). In each layer every cook does a share, and
+   **nobody starts the next layer until all cooks are done**: the cooks work
+   in step. The 32 cooks are rented, and steal time was 22–38% during the
+   32-thread run (about 0% just before it). With 32 cooks, at almost every
+   layer boundary one of them is out on loan, and the other 31 stand waiting.
+   That's 625 ms per token at 32 threads vs 135 ms at 8.
 
-**Rule:** when the work is belt-bound, use just enough cooks to keep the belt
-busy. On this VM that's 4–10 threads, so 8 is a safe pick.
+**Rule:** when the work is belt-bound, use **the fewest cooks that keep the belt
+busy**. Extra cooks only add more people who must wait for each other. On this
+VM that's 4–10 threads, so 8 is a safe pick for this model.
+
+**The best count depends on the model and the machine**, so measure it once
+per model. A different format like `q8_0` needs a different amount of
+arithmetic per byte, so its plateau may start at a different count. Run it
+step 6a has a sweep script for this.
 
 **How to set it.** There are two ways:
 
@@ -228,50 +314,6 @@ busy. On this VM that's 4–10 threads, so 8 is a safe pick.
   FROM qwen2.5:7b-instruct
   PARAMETER num_thread 8
   ```
-
-### Where a GPU would fit: the kitchen next door
-
-This VM has no GPU. The Ollama log says `inference compute ... library=cpu`.
-Knowing what a GPU would change explains why the numbers here look the way they
-do.
-
-A **GPU** is a second kitchen, next door, built for one kind of job: the same
-simple step done to a huge amount of data at once. Model math is mostly
-multiplying big grids of numbers (**matrix multiplication**), which is exactly
-that kind of job.
-
-| | CPU kitchen (this VM) | GPU kitchen |
-|---|---|---|
-| Cooks | A few skilled chefs (cores). Each can handle any recipe. | Thousands of simple line cooks, all doing the same step together |
-| Fridge | **RAM**: 48 GB here | **VRAM**, the GPU's own memory (§20): e.g. 24 GB on an RTX 4090, 80 GB on an H100 |
-| Belt (memory bandwidth) | ~35 GB/s here (4.7 GB × 7.5 tok/s) | ~1,000 GB/s on an RTX 4090, ~3,350 GB/s on an H100 SXM (NVIDIA spec sheets) |
-
-**PCIe** is the road between the two kitchens. It's slower than either belt,
-so it's used mainly at load time: disk → RAM → PCIe → VRAM. After that, every
-token reads the weights from VRAM.
-
-What changes:
-
-- **Prefill** is compute-bound, so thousands of cooks speed it up a lot.
-- **Decode** is still belt-bound on a GPU, but on a far faster belt. Rough upper
-  limit for this model: 4.7 GB ÷ 1,000 GB/s ≈ 200 tok/s on an RTX 4090, against
-  ~7.5 here. Real numbers come in lower. Same rule as before: decode speed ≈
-  belt speed ÷ model size.
-- **What has to fit** becomes VRAM, not RAM. RAM still holds the OS, Ollama,
-  your own programs, and any layers that don't fit in VRAM.
-- **If the model doesn't fit in VRAM**, Ollama puts some layers on the GPU and
-  the rest on the CPU. Every token passes through both kitchens, so the slow
-  one sets the pace.
-- **Apple Silicon** has one fridge shared by both kitchens (unified memory, §20).
-  There's no PCIe copy, and a 64 GB Mac can hold models that no 24 GB GPU can.
-  But it has fewer cooks than a big GPU, so long prompts (prefill) are slower.
-
-`ollama ps` shows which fridge a loaded model is in. The `PROCESSOR` column is
-about memory placement, not CPU count or threads: `100% CPU` means all of the
-model is in RAM, `100% GPU` means all of it is in VRAM, and `48%/52% CPU/GPU`
-is a split (<https://docs.ollama.com/faq>). The `SIZE` column is larger than
-the file (5.1 GB vs 4.7 GB for `qwen2.5:7b-instruct`) because it includes the
-KV cache and working buffers.
 
 ---
 
@@ -288,7 +330,7 @@ This step has no Go. The only file is `Makefile`, which every later step uses:
 
 ## Run it
 
-Run everything on the VM (Ubuntu 24.04).
+Run everything on the VM (`ssh ubuntu@10.2.1.49`, Ubuntu 24.04).
 
 ### 1. Install Ollama and the tools
 
@@ -297,7 +339,17 @@ curl -fsSL https://ollama.com/install.sh | sh     # installs a systemd service
 sudo apt-get install -y jq git
 systemctl status ollama --no-pager                # should be "active (running)"
 ollama --version
-export OLLAMA_HOST=http://localhost:11434         # the same env var `rag` reads
+echo 'export OLLAMA_HOST=http://localhost:11434' >> ~/.bashrc   # the env var `rag` reads
+source ~/.bashrc
+```
+
+Look at the kitchen you got:
+
+```bash
+lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|cache'   # cooks, cutting boards
+free -g                                                            # fridge
+df -h /                                                            # warehouse
+journalctl -u ollama --no-pager | grep 'inference compute'         # library=cpu: no GPU
 ```
 
 ### 2. Pull the models
@@ -356,7 +408,8 @@ curl -s $OLLAMA_HOST/v1/chat/completions \
 ```
 
 This runs with Ollama's default of 32 threads, so expect it to take minutes
-(about 3 on this VM). Step 6 fixes that. For now, just look at the format.
+(about 3 on this VM). Step 6 shows why, and step 7 fixes it. For now, just look
+at the format.
 
 Illustrative output, shortened:
 
@@ -409,12 +462,75 @@ curl -s $OLLAMA_HOST/api/embed \
 
 ### 6. Measure tokens/sec: threads, 4-bit vs 8-bit, 7B vs 27B
 
-Define a shell function that sends the same request to any model and computes
-both rates. `temperature: 0` and a fixed `seed` keep the runs comparable (§5).
-`num_predict` caps the output length (default 256, override with
-`NUM_PREDICT=...`). `num_thread` sets the number of cooks (default 8, override
-with `NUM_THREAD=...`). The optional third argument sets `think`. Send it only
-to Qwen3.8, because qwen2.5 isn't a thinking model:
+**6a. Find the best thread count for each model.** Save this script once:
+
+```bash
+cat > ~/sweep.bash <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+host="${OLLAMA_HOST:-http://localhost:11434}"
+
+sweep() {   # usage: sweep <model> [think]
+  for th in ${THREADS:-4 6 8 10 12 16 32}; do
+    jq -n --arg m "$1" --arg t "${2:-}" --argjson th "$th" \
+      '{model:$m, prompt:"Explain Postgres replication lag in 3 bullets.", stream:false,
+        options:{temperature:0, num_predict:48, num_thread:$th}}
+       + (if $t == "" then {} else {think: ($t|fromjson)} end)' |
+    curl -sf "$host/api/generate" -d @- |
+    jq -c --argjson th "$th" '{threads:$th,
+      prefill_tok_s:(.prompt_eval_count/(.prompt_eval_duration/1e9)),
+      decode_tok_s:(.eval_count/(.eval_duration/1e9))}'
+  done
+  ollama stop "$1"
+}
+
+[ $# -ge 1 ] || { echo "usage: $0 <model> [think]" >&2; exit 1; }
+sweep "$@"
+EOF
+chmod +x ~/sweep.bash
+```
+
+The file defines the function `sweep`, and the last line actually calls it with
+the script's arguments. Without that last line, running the script would only
+define the function and exit, printing nothing.
+
+Run it for each model. Pass `false` as the second argument for Qwen3.8 to turn
+thinking off. Run `vmstat 2` in a second terminal and watch the `st` column:
+
+```bash
+~/sweep.bash qwen2.5:7b-instruct
+~/sweep.bash qwen2.5:7b-instruct-q8_0
+THREADS="6 8 12 16" ~/sweep.bash qwen3.8:27b-q4_K_M false      # fewer points: each 18 GB reload is slow
+```
+
+Each new thread count makes Ollama reload the model. `decode_tok_s` doesn't
+include that load time, but the run takes longer.
+
+How to read it: pick the **smallest** thread count where `decode_tok_s` stops
+improving. Illustrative output, **not measured**:
+
+```
+{"threads":4,"prefill_tok_s":30.1,"decode_tok_s":3.9}
+{"threads":6,"prefill_tok_s":41.0,"decode_tok_s":4.4}
+{"threads":8,"prefill_tok_s":50.2,"decode_tok_s":4.5}    ← plateau starts: pick 8
+{"threads":10,"prefill_tok_s":57.9,"decode_tok_s":4.5}
+{"threads":12,"prefill_tok_s":61.3,"decode_tok_s":4.3}
+{"threads":16,"prefill_tok_s":60.8,"decode_tok_s":3.1}   ← cooks waiting on each other
+{"threads":32,"prefill_tok_s":40.5,"decode_tok_s":1.2}
+```
+
+Smallest, because fewer cooks leave the rest free for everything else on the VM
+(`rag`, kubectl, and Postgres in later steps), and they're less exposed to
+steal time.
+
+**6b. Speed, with thinking off.** Define a function that sends the same request
+to any model and computes both rates. `temperature: 0` and a fixed `seed` keep
+the runs comparable (§5). `num_predict` caps the output length (default 256,
+override with `NUM_PREDICT=...`). `num_thread` defaults to 8 (override with
+`NUM_THREAD=...` if 6a picked something else for a model). The optional third
+argument sets `think`. Send it only to Qwen3.8, because qwen2.5 isn't a
+thinking model:
 
 ```bash
 bench() {
@@ -443,32 +559,9 @@ Summarise the text above in 5 bullets."
 The prompt is ~4,000 characters, which is about 1,000 tokens by the "1 token ≈
 4 characters" rule (§2). If `README.md` is shorter, any KubeDB `.md` file works.
 
-**6a. Find the thread count.** Reproduce the thread table from the Concept
-section. Run `vmstat 2` in a second terminal while this runs, and watch the
-`st` (steal) column:
-
-```bash
-for th in 4 8 16 32; do
-  NUM_THREAD=$th NUM_PREDICT=48 bench qwen2.5:7b-instruct "Explain Postgres replication lag in 3 bullets." |
-    jq -c --arg th $th '{threads:$th, prefill_tok_s, decode_tok_s}'
-done
-```
-
-Changing `num_thread` makes Ollama reload the model, so each line includes a
-few seconds of loading. `decode_tok_s` doesn't include that time. Then check
-the 27B model too. Its best count may differ:
-
-```bash
-for th in 8 16; do
-  NUM_THREAD=$th NUM_PREDICT=32 bench qwen3.8:27b-q4_K_M "hi" false | jq -c --arg th $th '{threads:$th, decode_tok_s}'
-done
-```
-
-Use the best number as `NUM_THREAD` for the rest of step 6 if it isn't 8.
-
-**6b. Speed, with thinking off.** Each model runs twice, cold then warm. Then
-`ollama stop` unloads it, so the next model gets the RAM. 18 GB and 30 GB
-models don't fit side by side with the others.
+Each model runs twice, cold then warm. Then `ollama stop` empties its part of
+the fridge, so the next model gets the RAM. 18 GB and 30 GB models don't fit
+side by side with the others.
 
 ```bash
 for m in qwen2.5:7b-instruct qwen2.5:7b-instruct-q8_0; do
@@ -487,6 +580,15 @@ Illustrative output, **not measured**. Your numbers will be different:
   "thinking_chars": 0, "answer": "- KubeDB is ..." }
 ```
 
+Ollama's CLI prints the same two rates if you pass `--verbose`, which is a quick
+way to cross-check. It uses the model's default thread count, so expect a slow
+`eval rate`:
+
+```bash
+ollama run qwen2.5:7b-instruct --verbose "Explain Postgres replication lag in 3 bullets."
+# ... prompt eval rate: N tokens/s ... eval rate: N tokens/s
+```
+
 **6c. What thinking costs.** Same model, same short question, thinking off and
 then on. Raise the cap so the reasoning has room to finish:
 
@@ -500,13 +602,6 @@ Before you run the `true` line, estimate the worst case: 2048 ÷ your
 `decode_tok_s` from 6b is how long it could take, in seconds. Use that to
 decide whether to wait or lower `NUM_PREDICT`.
 
-Ollama's CLI prints the same two rates if you pass `--verbose`, which is a quick way to cross-check:
-
-```bash
-ollama run qwen2.5:7b-instruct --verbose "Explain Postgres replication lag in 3 bullets."
-# ... prompt eval rate: N tokens/s ... eval rate: N tokens/s
-```
-
 ### 7. Pick the chat model
 
 Read the `answer` fields from 6b next to each other, then weigh quality against
@@ -519,13 +614,17 @@ decode speed. Two questions to settle:
   `output_tokens` growing?
 
 `rag` talks to the `/v1` endpoint (step 4a onward), which can't send
-`num_thread`. So bake your thread count into a derived model of the one you
-picked:
+`num_thread`. So bake the thread count from 6a into a derived model of the one
+you picked. One derived model per base model:
 
 ```bash
 printf 'FROM qwen2.5:7b-instruct\nPARAMETER num_thread 8\n' > /tmp/Modelfile
 ollama create qwen2.5-7b-t8 -f /tmp/Modelfile
 ollama show qwen2.5-7b-t8 --parameters        # should list num_thread 8
+
+# the same pattern for any other model, e.g.:
+printf 'FROM qwen3.8:27b-q4_K_M\nPARAMETER num_thread 8\n' > /tmp/Modelfile
+ollama create qwen3.8-27b-t8 -f /tmp/Modelfile
 ```
 
 Check it over `/v1`. The same request as Run it step 4 dropped from about 3 min
@@ -544,7 +643,6 @@ once, so `rag` picks it up later:
 
 ```bash
 echo 'export RAG_CHAT_MODEL=qwen2.5-7b-t8' >> ~/.bashrc
-echo 'export OLLAMA_HOST=http://localhost:11434' >> ~/.bashrc
 source ~/.bashrc
 ```
 
@@ -559,32 +657,32 @@ source ~/.bashrc
 2. **`prompt_tokens` vs `prompt_eval_count`.** Your 8-word question took about
    38 tokens, not 8. The model's **chat template** wraps your text in role
    markers and a default system prompt (§4) before tokenizing it.
-3. **Cold vs warm.** `load_s` is several seconds on the first run and near zero
-   on the second. Run `ollama ps` to see which models are loaded and when they
-   will be unloaded (5 minutes idle by default). `PROCESSOR` should say
-   `100% CPU`: all of the model is in RAM, since there's no GPU.
+3. **Cold vs warm.** `load_s` is several seconds on the first run (warehouse →
+   fridge) and near zero on the second. Run `ollama ps` to see which models are
+   loaded and when they will be unloaded. `PROCESSOR` should say `100% CPU`:
+   all of the model is in RAM, since there's no GPU.
 4. **Prefill is much faster than decode.** Compare `prefill_tok_s` with
    `decode_tok_s` for each model. This is §2's "input is fast, output is slow",
    measured on your own hardware.
 5. **Threads (6a).** `decode_tok_s` should stay flat over a range of thread
-   counts and then fall. `prefill_tok_s` keeps rising. In `vmstat`, `st`
-   jumps when you run 32 threads. That's the belt limit plus the waiting at
-   each layer, from "Threads: more cooks can be slower".
-6. **Bytes vs speed.** Divide each model's `decode_tok_s` by the
-   `qwen2.5:7b-instruct` rate and compare with the predicted column in "Why
-   bigger or higher-precision models are slower here". If the measured ratios
-   follow file size, decode on this VM is limited by how fast RAM can be read.
+   counts and then fall. `prefill_tok_s` keeps rising for longer. In `vmstat`,
+   `st` jumps at 32 threads. That's the belt limit, plus cooks in step waiting
+   for a cook out on loan.
+6. **Bytes vs speed (6b).** Divide each model's `decode_tok_s` by the
+   `qwen2.5:7b-instruct` rate and compare with the prediction table in Concept
+   §5. If the measured ratios follow file size, decode on this VM is
+   belt-bound.
 7. **Thinking cost (6c).** With `think: true`, `thinking_chars` is non-zero and
    `output_tokens` should jump, because the reasoning is generated one token at
    a time like the answer. `total_s` grows by about the extra tokens ÷
    `decode_tok_s`.
 8. **The warm prefill may be suspiciously fast.** On the second identical
-   request, Ollama can reuse the cached prompt (KV cache), so
+   request, Ollama can reuse the KV cache from the first, so
    `prompt_eval_count` may drop and `prefill_tok_s` may come back `null`. Use
    the first run for the prefill rate. Use either run for decode.
 9. **`free -g` while a 27B model is loaded.** The RAM it uses is the weights
-   (`ollama list` size) plus the KV cache (§20). With `qwen3.8:27b-q8_0`,
-   that's 30 GB of 48 GB before the conversation even starts.
+   (`ollama list` size) plus the KV cache. With `qwen3.8:27b-q8_0`, that's
+   30 GB of the 48 GB fridge before the conversation even starts.
 
 ---
 
@@ -595,8 +693,8 @@ source ~/.bashrc
 Ollama doesn't run a model at its full context window. It uses a smaller
 default `num_ctx`, which is 4096 tokens in recent versions (older versions:
 2048; check `ollama show qwen2.5:7b-instruct` and the docs for your version).
-If the prompt is longer than `num_ctx`, Ollama **silently drops the start of
-the prompt**. There is no error.
+`ollama ps` shows it in the `CONTEXT` column. If the prompt is longer than
+`num_ctx`, Ollama **silently drops the start of the prompt**. There is no error.
 
 Put a fact at the very beginning, bury it under ~30 KB of docs (~7,500 tokens),
 and then ask for it:
@@ -609,7 +707,7 @@ $(find ~/kubedb-docs -name '*.md' | head -n 40 | xargs cat | head -c 30000)
 What is the secret word? Answer with one word."
 
 jq -n --arg p "$LONG" '{model:"qwen2.5:7b-instruct", prompt:$p, stream:false,
-  options:{temperature:0}}' |
+  options:{temperature:0, num_thread:8}}' |
 curl -s $OLLAMA_HOST/api/generate -d @- | jq '{response, prompt_eval_count}'
 ```
 
@@ -620,13 +718,14 @@ Now raise the window and run it again:
 
 ```bash
 jq -n --arg p "$LONG" '{model:"qwen2.5:7b-instruct", prompt:$p, stream:false,
-  options:{temperature:0, num_ctx:16384}}' |
+  options:{temperature:0, num_thread:8, num_ctx:16384}}' |
 curl -s $OLLAMA_HOST/api/generate -d @- | jq '{response, prompt_eval_count, prefill_s:(.prompt_eval_duration/1e9)}'
 ```
 
 `prompt_eval_count` should now show the full prompt, and the model should
 answer `KUBEPANDA`. Look at `prefill_s`. That's TTFT growing with input size
-(§3), on a CPU.
+(§3), on a CPU. Run `ollama ps` too: `SIZE` grows, because a bigger window
+means a bigger KV cache.
 
 The lesson for step 4b: when RAG pastes chunks into the prompt, check
 `prompt_eval_count` against `num_ctx`. Otherwise you may be throwing away your
@@ -638,7 +737,9 @@ own retrieved context.
 
 Ollama version:
 
-Threads (6a), decode tok/s: 4 = ____, 8 = ____, 16 = ____, 32 = ____; steal % at 32 = ____; best for 27B = ____
+Kitchen (Run it 1): CPU model ____, vCPUs ____, cache sizes ____, RAM ____, disk ____
+
+Threads (6a), best count / decode tok/s at it: qwen2.5 7B q4 = ____ / ____, 7B q8 = ____ / ____, qwen3.8 27B q4 = ____ / ____; steal % at 32 threads = ____
 
 | Model | load_s (cold) | prompt tokens | prefill tok/s | output tokens | decode tok/s | total_s | decode ratio vs 7B q4 (predicted) |
 |---|---|---|---|---|---|---|---|
@@ -653,4 +754,4 @@ Quality notes (4-bit vs 8-bit; qwen2.5 7B vs qwen3.8 27B; thinking off vs on):
 
 Break it: default `num_ctx` = ____, `prompt_eval_count` before / after = ____ / ____, prefill_s at 16K = ____
 
-Chosen chat model (and why):
+Chosen chat model and thread count (and why):
