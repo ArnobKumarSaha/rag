@@ -47,10 +47,25 @@ Sources: <https://ollama.com/library/qwen2.5/tags>,
 - **Instruct**: `qwen2.5:7b-instruct` follows instructions. A *base* model only
   continues text (§19, "Base vs Instruct"). Qwen3.8 is post-trained, so it
   follows instructions too (§19, model card item 2).
-- **Quantization** stores each weight in fewer bits (§19). The suffix names the
-  format: `Q4_K_M` is about 4.5 bits per weight, `q8_0` is 8 bits. 8-bit loses
-  less quality than 4-bit, but it is about twice as big. Which matters more on
-  this VM is what you measure.
+- **Quantization** stores each weight in fewer bits (§19). 8-bit loses less
+  quality than 4-bit, but it is about twice as big. Which matters more on this
+  VM is what you measure. The suffix names the llama.cpp format
+  (<https://github.com/ggml-org/llama.cpp/pull/1684>):
+  - **`Q4`**: each weight is stored as a whole number 0–15 (4 bits).
+  - **`K`**: weights are quantized in blocks of 32, and each block keeps its own
+    *min* and *scale* (step size). Example: a block spans −0.12 to +0.09, so
+    scale = 0.21 / 15 = 0.014. The weight 0.031 is stored as
+    (0.031 + 0.12) / 0.014 ≈ 11 and read back as −0.12 + 11 × 0.014 = 0.034,
+    an error of 0.003. A small block has a narrow range, so the steps are fine.
+    The scales and mins themselves are stored in 6 bits, so `Q4_K` costs 4.5
+    bits per weight.
+  - **`M`** (medium): a mix. About half of two sensitive tensors
+    (`attention.wv`, `feed_forward.w2`) use 6-bit `Q6_K`, and the rest use
+    `Q4_K`. `S` uses fewer 6-bit tensors, `L` uses more. That's why the file is
+    4.7 GB, not 7.62B × 4 bits = 3.8 GB: it works out to about 4.9 bits per
+    weight.
+  - **`q8_0`**: an older, simpler format. 8 bits per weight, blocks of 32, a
+    scale only. `_0` means no min, so the values are symmetric around zero.
 - **Thinking**: Qwen3.8 writes a hidden chain of reasoning before its answer by
   default (§19, model card item 8). Those are extra *output* tokens. Ollama's
   native API turns it off with `"think": false`.
@@ -213,6 +228,50 @@ busy. On this VM that's 4–10 threads, so 8 is a safe pick.
   FROM qwen2.5:7b-instruct
   PARAMETER num_thread 8
   ```
+
+### Where a GPU would fit: the kitchen next door
+
+This VM has no GPU. The Ollama log says `inference compute ... library=cpu`.
+Knowing what a GPU would change explains why the numbers here look the way they
+do.
+
+A **GPU** is a second kitchen, next door, built for one kind of job: the same
+simple step done to a huge amount of data at once. Model math is mostly
+multiplying big grids of numbers (**matrix multiplication**), which is exactly
+that kind of job.
+
+| | CPU kitchen (this VM) | GPU kitchen |
+|---|---|---|
+| Cooks | A few skilled chefs (cores). Each can handle any recipe. | Thousands of simple line cooks, all doing the same step together |
+| Fridge | **RAM**: 48 GB here | **VRAM**, the GPU's own memory (§20): e.g. 24 GB on an RTX 4090, 80 GB on an H100 |
+| Belt (memory bandwidth) | ~35 GB/s here (4.7 GB × 7.5 tok/s) | ~1,000 GB/s on an RTX 4090, ~3,350 GB/s on an H100 SXM (NVIDIA spec sheets) |
+
+**PCIe** is the road between the two kitchens. It's slower than either belt,
+so it's used mainly at load time: disk → RAM → PCIe → VRAM. After that, every
+token reads the weights from VRAM.
+
+What changes:
+
+- **Prefill** is compute-bound, so thousands of cooks speed it up a lot.
+- **Decode** is still belt-bound on a GPU, but on a far faster belt. Rough upper
+  limit for this model: 4.7 GB ÷ 1,000 GB/s ≈ 200 tok/s on an RTX 4090, against
+  ~7.5 here. Real numbers come in lower. Same rule as before: decode speed ≈
+  belt speed ÷ model size.
+- **What has to fit** becomes VRAM, not RAM. RAM still holds the OS, Ollama,
+  your own programs, and any layers that don't fit in VRAM.
+- **If the model doesn't fit in VRAM**, Ollama puts some layers on the GPU and
+  the rest on the CPU. Every token passes through both kitchens, so the slow
+  one sets the pace.
+- **Apple Silicon** has one fridge shared by both kitchens (unified memory, §20).
+  There's no PCIe copy, and a 64 GB Mac can hold models that no 24 GB GPU can.
+  But it has fewer cooks than a big GPU, so long prompts (prefill) are slower.
+
+`ollama ps` shows which fridge a loaded model is in. The `PROCESSOR` column is
+about memory placement, not CPU count or threads: `100% CPU` means all of the
+model is in RAM, `100% GPU` means all of it is in VRAM, and `48%/52% CPU/GPU`
+is a split (<https://docs.ollama.com/faq>). The `SIZE` column is larger than
+the file (5.1 GB vs 4.7 GB for `qwen2.5:7b-instruct`) because it includes the
+KV cache and working buffers.
 
 ---
 
@@ -502,7 +561,8 @@ source ~/.bashrc
    markers and a default system prompt (§4) before tokenizing it.
 3. **Cold vs warm.** `load_s` is several seconds on the first run and near zero
    on the second. Run `ollama ps` to see which models are loaded and when they
-   will be unloaded (5 minutes idle by default).
+   will be unloaded (5 minutes idle by default). `PROCESSOR` should say
+   `100% CPU`: all of the model is in RAM, since there's no GPU.
 4. **Prefill is much faster than decode.** Compare `prefill_tok_s` with
    `decode_tok_s` for each model. This is §2's "input is fast, output is slow",
    measured on your own hardware.
