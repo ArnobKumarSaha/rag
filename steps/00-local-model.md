@@ -60,16 +60,68 @@ Sources: <https://ollama.com/library/qwen2.5/tags>,
   of numbers instead of writing text. Step 1 uses it. Here you only pull it and
   check that it answers.
 
+### CPU and memory: a kitchen
+
+To understand the speeds in this step, you need a picture of where the model
+lives and who does the work. Think of a kitchen.
+
+**The CPU is the cook.** It does the work (add, multiply, compare), very fast,
+but only on what's right in front of it.
+
+- A **core** is one cook. The VM has 32 virtual cores (**vCPUs**).
+- A **thread** is one task handed to a cook. `num_thread: 8` tells Ollama to
+  split the work into 8 tasks, run by 8 cooks at once.
+
+**Memory is where the ingredients wait.** There are three places, at three
+distances:
+
+| Kitchen | Computer | Size on this VM (roughly) | Reach time |
+|---|---|---|---|
+| Cutting board, under the cook's hands | **Cache**, inside the CPU | a few MB | instant |
+| Fridge in the next room | **RAM** | 48 GB | slower |
+| Warehouse across town | **Disk** | 150 GB | much slower |
+
+Data travels from the fridge to the cutting board on a **conveyor belt**. The
+belt's speed, in GB per second, is the **memory bandwidth**. All cooks share one
+belt. Hiring more cooks doesn't make the belt faster.
+
+**Where a model lives, step by step:**
+
+1. `ollama pull` puts the weights in the **warehouse** (disk, under
+   `/usr/share/ollama/.ollama/models`). They stay there until `ollama rm`.
+2. The first request to a model copies the weights from disk into the
+   **fridge** (RAM). That's the `load_duration` in the response, and it takes
+   seconds.
+3. While the model stays loaded, every token reads the weights from RAM, never
+   from disk. `ollama ps` shows what's in RAM right now.
+4. After 5 idle minutes, Ollama empties that part of the fridge. The disk copy
+   stays, so the next request loads it again.
+
+**Two kinds of work.**
+
+- **The belt is the limit** (**memory-bandwidth-bound**). Each ingredient needs
+  very little cooking, for example "add 1 to each of a billion numbers". The
+  cooks finish instantly and wait for the belt. More cooks means more people
+  waiting at the same belt.
+- **The cooks are the limit** (**compute-bound**). Each ingredient needs lots of
+  work once it's on the board. Here more cooks help, up to the number of real
+  cooks you have.
+
+The next section shows that a model does both kinds of work, one after the other.
+
 ### A request has two phases: prefill and decode
 
 Every generation request goes through two phases (`ai-platform-basics.md` §5):
 
 - **Prefill** (Ollama calls it *prompt eval*): the model reads the whole prompt
-  in one pass and processes all the input tokens in parallel. This phase sets
-  **TTFT**, the time to first token.
+  in one pass. Each weight rides the belt once and is then used for *every*
+  prompt token, so there's plenty of cooking per trip. That makes prefill
+  **compute-bound**. This phase sets **TTFT**, the time to first token.
 - **Decode** (Ollama calls it *eval*): the model writes the answer one token at
-  a time, and each token needs a full pass over all the weights. This phase sets
-  how fast the answer streams out.
+  a time. Each token needs *all* the weights, the weights are far bigger than
+  the cache, and each weight gets only about one multiply-add. So for every
+  token the whole model rides the belt again. That makes decode
+  **memory-bandwidth-bound**. This phase sets how fast the answer streams out.
 
 So a model has **two speeds**, both measured in tokens per second:
 
@@ -94,9 +146,10 @@ Ollama's native response reports these timings in **nanoseconds**:
 
 ### Why bigger or higher-precision models are slower here
 
-The VM has **no GPU**, so the CPU does the math and the weights sit in ordinary
-RAM. Each decode step reads every weight once, so decode speed should roughly
-follow "how many GB must be read per token", which is the model's file size.
+The VM has **no GPU**, so the CPU does the math and the loaded weights sit in
+ordinary RAM. Decode is belt-bound: every token moves the whole model across the
+belt. So decode speed should roughly follow "how many GB ride the belt per
+token", which is the model's file size.
 That gives a hypothesis, relative to `qwen2.5:7b-instruct` at 4.7 GB:
 
 | Model | Size | Predicted decode speed |
@@ -110,6 +163,56 @@ These are predictions, not measurements. You fill in the real numbers.
 
 Thinking multiplies the cost: if Qwen3.8 thinks for 600 tokens before a
 200-token answer, you wait for 800 tokens at its slowest decode speed.
+
+### Threads: more cooks can be slower
+
+By default Ollama uses one thread per vCPU, so 32 on this VM. The Ollama log
+shows `n_threads = 32`. You'd expect 32 cooks to beat 8. On this VM, they
+don't. These are **measured** numbers from this VM (2026-10-04,
+`qwen2.5:7b-instruct` already loaded, short prompt, 48 output tokens):
+
+| Threads | prefill tok/s | decode tok/s |
+|---|---|---|
+| 4 | 43 | 7.5 |
+| 6 | 57 | 7.2 |
+| 8 | – | 7.4 |
+| 10 | 72 | 7.7 |
+| 12 | 80 | 6.9 |
+| 16 | – | 5.3 |
+| 32 (default) | – | 1.6–1.7 |
+
+Two things explain the table:
+
+1. **Decode is flat from 4 to 10 threads.** That's the belt limit. 4 cooks
+   already take everything the belt delivers: 4.7 GB × 7.5 tok/s ≈ 35 GB/s.
+   Prefill keeps getting faster with more threads (43 → 80 tok/s), because it's
+   compute-bound and more cooks help.
+2. **Past ~12 threads, decode gets slower.** The model works layer by layer
+   (about 28 layers for this model). In each layer, every cook does a share,
+   and **nobody starts the next layer until all cooks are done**. The 32 vCPUs
+   are borrowed: Harvester shares the real cores with other VMs, and sometimes
+   pauses a vCPU to run someone else's work. That pause is **steal time**, the
+   `st` column in `vmstat`. It was 22–38% during the 32-thread run and about
+   0% just before it. With 32 cooks, at almost every layer boundary one of them
+   has been paused, and the other 31 stand waiting. That's 625 ms per token at
+   32 threads vs 135 ms at 8.
+
+**Rule:** when the work is belt-bound, use just enough cooks to keep the belt
+busy. On this VM that's 4–10 threads, so 8 is a safe pick.
+
+**How to set it.** There are two ways:
+
+- **Per request:** `"options": {"num_thread": 8}`. This works on the native
+  `/api/*` endpoints only. The OpenAI-compatible `/v1` request has no field for
+  it.
+- **Bake it into a derived model** with a **Modelfile**, Ollama's recipe file
+  that adds parameters on top of existing weights. This works for `/v1` too,
+  and it doesn't copy the weights:
+
+  ```
+  FROM qwen2.5:7b-instruct
+  PARAMETER num_thread 8
+  ```
 
 ---
 
@@ -193,6 +296,9 @@ curl -s $OLLAMA_HOST/v1/chat/completions \
        "messages":[{"role":"user","content":"Explain Postgres replication lag in 3 bullets."}]}' | jq
 ```
 
+This runs with Ollama's default of 32 threads, so expect it to take minutes
+(about 3 on this VM). Step 6 fixes that. For now, just look at the format.
+
 Illustrative output, shortened:
 
 ```json
@@ -242,19 +348,21 @@ curl -s $OLLAMA_HOST/api/embed \
 # 1
 ```
 
-### 6. Measure tokens/sec: 4-bit vs 8-bit, 7B vs 27B
+### 6. Measure tokens/sec: threads, 4-bit vs 8-bit, 7B vs 27B
 
 Define a shell function that sends the same request to any model and computes
 both rates. `temperature: 0` and a fixed `seed` keep the runs comparable (§5).
 `num_predict` caps the output length (default 256, override with
-`NUM_PREDICT=...`). The optional third argument sets `think`. Send it only to
-Qwen3.8, because qwen2.5 isn't a thinking model:
+`NUM_PREDICT=...`). `num_thread` sets the number of cooks (default 8, override
+with `NUM_THREAD=...`). The optional third argument sets `think`. Send it only
+to Qwen3.8, because qwen2.5 isn't a thinking model:
 
 ```bash
 bench() {
-  jq -n --arg m "$1" --arg p "$2" --arg t "${3:-}" --argjson n "${NUM_PREDICT:-256}" \
+  jq -n --arg m "$1" --arg p "$2" --arg t "${3:-}" \
+        --argjson n "${NUM_PREDICT:-256}" --argjson th "${NUM_THREAD:-8}" \
     '{model:$m, prompt:$p, stream:false,
-      options:{temperature:0, seed:42, num_predict:$n}}
+      options:{temperature:0, seed:42, num_predict:$n, num_thread:$th}}
      + (if $t == "" then {} else {think: ($t|fromjson)} end)' |
   curl -s "$OLLAMA_HOST/api/generate" -d @- |
   jq '{model,
@@ -276,7 +384,30 @@ Summarise the text above in 5 bullets."
 The prompt is ~4,000 characters, which is about 1,000 tokens by the "1 token ≈
 4 characters" rule (§2). If `README.md` is shorter, any KubeDB `.md` file works.
 
-**6a. Speed, with thinking off.** Each model runs twice, cold then warm. Then
+**6a. Find the thread count.** Reproduce the thread table from the Concept
+section. Run `vmstat 2` in a second terminal while this runs, and watch the
+`st` (steal) column:
+
+```bash
+for th in 4 8 16 32; do
+  NUM_THREAD=$th NUM_PREDICT=48 bench qwen2.5:7b-instruct "Explain Postgres replication lag in 3 bullets." |
+    jq -c --arg th $th '{threads:$th, prefill_tok_s, decode_tok_s}'
+done
+```
+
+Changing `num_thread` makes Ollama reload the model, so each line includes a
+few seconds of loading. `decode_tok_s` doesn't include that time. Then check
+the 27B model too. Its best count may differ:
+
+```bash
+for th in 8 16; do
+  NUM_THREAD=$th NUM_PREDICT=32 bench qwen3.8:27b-q4_K_M "hi" false | jq -c --arg th $th '{threads:$th, decode_tok_s}'
+done
+```
+
+Use the best number as `NUM_THREAD` for the rest of step 6 if it isn't 8.
+
+**6b. Speed, with thinking off.** Each model runs twice, cold then warm. Then
 `ollama stop` unloads it, so the next model gets the RAM. 18 GB and 30 GB
 models don't fit side by side with the others.
 
@@ -297,7 +428,7 @@ Illustrative output, **not measured**. Your numbers will be different:
   "thinking_chars": 0, "answer": "- KubeDB is ..." }
 ```
 
-**6b. What thinking costs.** Same model, same short question, thinking off and
+**6c. What thinking costs.** Same model, same short question, thinking off and
 then on. Raise the cap so the reasoning has room to finish:
 
 ```bash
@@ -307,7 +438,7 @@ NUM_PREDICT=2048 bench qwen3.8:27b-q4_K_M "$Q" true
 ```
 
 Before you run the `true` line, estimate the worst case: 2048 ÷ your
-`decode_tok_s` from 6a is how long it could take, in seconds. Use that to
+`decode_tok_s` from 6b is how long it could take, in seconds. Use that to
 decide whether to wait or lower `NUM_PREDICT`.
 
 Ollama's CLI prints the same two rates if you pass `--verbose`, which is a quick way to cross-check:
@@ -319,20 +450,43 @@ ollama run qwen2.5:7b-instruct --verbose "Explain Postgres replication lag in 3 
 
 ### 7. Pick the chat model
 
-Read the `answer` fields from 6a next to each other, then weigh quality against
+Read the `answer` fields from 6b next to each other, then weigh quality against
 decode speed. Two questions to settle:
 
 - Is the 8-bit answer actually better than the 4-bit answer of the same model,
   and is it worth the speed you measured?
 - Is Qwen3.8's answer better enough than qwen2.5's to pay for its decode speed,
-  with thinking off? And does thinking improve the 6b answer enough to pay for
+  with thinking off? And does thinking improve the 6c answer enough to pay for
   `output_tokens` growing?
 
-`rag` defaults to `qwen2.5:7b-instruct`. If you choose a different model,
-export it before every later step:
+`rag` talks to the `/v1` endpoint (step 4a onward), which can't send
+`num_thread`. So bake your thread count into a derived model of the one you
+picked:
 
 ```bash
-export RAG_CHAT_MODEL=qwen3.8:27b-q4_K_M      # only if you picked it
+printf 'FROM qwen2.5:7b-instruct\nPARAMETER num_thread 8\n' > /tmp/Modelfile
+ollama create qwen2.5-7b-t8 -f /tmp/Modelfile
+ollama show qwen2.5-7b-t8 --parameters        # should list num_thread 8
+```
+
+Check it over `/v1`. The same request as Run it step 4 dropped from about 3 min
+to 32 s on this VM (including ~8 s of loading):
+
+```bash
+time curl -s $OLLAMA_HOST/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen2.5-7b-t8","messages":[{"role":"user","content":"Explain Postgres replication lag in 3 bullets."}]}' \
+  | jq .usage
+```
+
+`rag` reads the model name from `RAG_CHAT_MODEL` (default
+`qwen2.5:7b-instruct`, which runs at 32 threads). Plain `curl` commands don't
+use it, because you type the model name in the request yourself. Export it
+once, so `rag` picks it up later:
+
+```bash
+echo 'export RAG_CHAT_MODEL=qwen2.5-7b-t8' >> ~/.bashrc
+echo 'export OLLAMA_HOST=http://localhost:11434' >> ~/.bashrc
+source ~/.bashrc
 ```
 
 ---
@@ -352,19 +506,23 @@ export RAG_CHAT_MODEL=qwen3.8:27b-q4_K_M      # only if you picked it
 4. **Prefill is much faster than decode.** Compare `prefill_tok_s` with
    `decode_tok_s` for each model. This is §2's "input is fast, output is slow",
    measured on your own hardware.
-5. **Bytes vs speed.** Divide each model's `decode_tok_s` by the
+5. **Threads (6a).** `decode_tok_s` should stay flat over a range of thread
+   counts and then fall. `prefill_tok_s` keeps rising. In `vmstat`, `st`
+   jumps when you run 32 threads. That's the belt limit plus the waiting at
+   each layer, from "Threads: more cooks can be slower".
+6. **Bytes vs speed.** Divide each model's `decode_tok_s` by the
    `qwen2.5:7b-instruct` rate and compare with the predicted column in "Why
    bigger or higher-precision models are slower here". If the measured ratios
    follow file size, decode on this VM is limited by how fast RAM can be read.
-6. **Thinking cost (6b).** With `think: true`, `thinking_chars` is non-zero and
+7. **Thinking cost (6c).** With `think: true`, `thinking_chars` is non-zero and
    `output_tokens` should jump, because the reasoning is generated one token at
    a time like the answer. `total_s` grows by about the extra tokens ÷
    `decode_tok_s`.
-7. **The warm prefill may be suspiciously fast.** On the second identical
+8. **The warm prefill may be suspiciously fast.** On the second identical
    request, Ollama can reuse the cached prompt (KV cache), so
    `prompt_eval_count` may drop and `prefill_tok_s` may come back `null`. Use
    the first run for the prefill rate. Use either run for decode.
-8. **`free -g` while a 27B model is loaded.** The RAM it uses is the weights
+9. **`free -g` while a 27B model is loaded.** The RAM it uses is the weights
    (`ollama list` size) plus the KV cache (§20). With `qwen3.8:27b-q8_0`,
    that's 30 GB of 48 GB before the conversation even starts.
 
@@ -420,6 +578,8 @@ own retrieved context.
 
 Ollama version:
 
+Threads (6a), decode tok/s: 4 = ____, 8 = ____, 16 = ____, 32 = ____; steal % at 32 = ____; best for 27B = ____
+
 | Model | load_s (cold) | prompt tokens | prefill tok/s | output tokens | decode tok/s | total_s | decode ratio vs 7B q4 (predicted) |
 |---|---|---|---|---|---|---|---|
 | qwen2.5:7b-instruct | | | | | | | 1× (1×) |
@@ -427,7 +587,7 @@ Ollama version:
 | qwen3.8:27b-q4_K_M | | | | | | | (~0.26×) |
 | qwen3.8:27b-q8_0 | | | | | | | (~0.16×) |
 
-Thinking (6b, qwen3.8:27b-q4_K_M): output tokens off / on = ____ / ____, total_s off / on = ____ / ____
+Thinking (6c, qwen3.8:27b-q4_K_M): output tokens off / on = ____ / ____, total_s off / on = ____ / ____
 
 Quality notes (4-bit vs 8-bit; qwen2.5 7B vs qwen3.8 27B; thinking off vs on):
 
